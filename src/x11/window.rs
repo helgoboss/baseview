@@ -12,7 +12,7 @@ use xcb::StructPtr;
 
 use super::XcbConnection;
 use crate::{
-    Event, MouseButton, MouseCursor, MouseEvent, PhyPoint, PhySize, ScrollDelta, WindowEvent,
+    Event, MouseButton, MouseCursor, MouseEvent, PhyPoint, PhySize, ScrollDelta, Size, WindowEvent,
     WindowHandler, WindowInfo, WindowOpenOptions, WindowScalePolicy,
 };
 
@@ -389,6 +389,24 @@ impl Window {
         self.close_requested = true;
     }
 
+    pub fn resize(&mut self, size: Size) {
+        let scaling = self.window_info.scale();
+        let new_window_info = WindowInfo::from_logical_size(size, scaling);
+
+        xcb::configure_window(
+            &self.xcb_connection.conn,
+            self.window_id,
+            &[
+                (xcb::CONFIG_WINDOW_WIDTH as u16, new_window_info.physical_size().width),
+                (xcb::CONFIG_WINDOW_HEIGHT as u16, new_window_info.physical_size().height),
+            ],
+        );
+        self.xcb_connection.conn.flush();
+
+        // This will trigger a `ConfigureNotify` event which will in turn change `self.window_info`
+        // and notify the window handler about it
+    }
+
     #[cfg(feature = "opengl")]
     pub fn gl_context(&self) -> Option<&crate::gl::GlContext> {
         self.gl_context.as_ref()
@@ -445,19 +463,21 @@ impl Window {
             xcb::ffi::xcb_get_file_descriptor(raw_conn)
         };
 
-        let mut next_frame = Instant::now() + self.frame_interval;
+        let mut last_frame = Instant::now();
         self.event_loop_running = true;
 
         while self.event_loop_running {
-            let now = Instant::now();
-            let until_next_frame = if now > next_frame {
+            // We'll try to keep a consistent frame pace. If the last frame couldn't be processed in
+            // the expected frame time, this will throttle down to prevent multiple frames from
+            // being queued up. The conditional here is needed because event handling and frame
+            // drawing is interleaved. The `poll()` function below will wait until the next frame
+            // can be drawn, or until the window receives an event. We thus need to manually check
+            // if it's already time to draw a new frame.
+            let next_frame = last_frame + self.frame_interval;
+            if Instant::now() >= next_frame {
                 handler.on_frame(&mut crate::Window::new(self));
-
-                next_frame = Instant::now() + self.frame_interval;
-                self.frame_interval
-            } else {
-                next_frame - now
-            };
+                last_frame = Instant::max(next_frame, Instant::now() - self.frame_interval);
+            }
 
             let mut fds = [PollFd::new(xcb_fd, PollFlags::POLLIN)];
 
@@ -466,7 +486,8 @@ impl Window {
             self.drain_xcb_events(handler);
 
             // FIXME: handle errors
-            poll(&mut fds, until_next_frame.subsec_millis() as i32).unwrap();
+            poll(&mut fds, next_frame.duration_since(Instant::now()).subsec_millis() as i32)
+                .unwrap();
 
             if let Some(revents) = fds[0].revents() {
                 if revents.contains(PollFlags::POLLERR) {
@@ -593,20 +614,17 @@ impl Window {
                 let detail = event.detail();
 
                 match detail {
-                    4 => {
+                    4..=7 => {
                         handler.on_event(
                             &mut crate::Window::new(self),
                             Event::Mouse(MouseEvent::WheelScrolled {
-                                delta: ScrollDelta::Lines { x: 0.0, y: 1.0 },
-                                modifiers: key_mods(event.state()),
-                            }),
-                        );
-                    }
-                    5 => {
-                        handler.on_event(
-                            &mut crate::Window::new(self),
-                            Event::Mouse(MouseEvent::WheelScrolled {
-                                delta: ScrollDelta::Lines { x: 0.0, y: -1.0 },
+                                delta: match detail {
+                                    4 => ScrollDelta::Lines { x: 0.0, y: 1.0 },
+                                    5 => ScrollDelta::Lines { x: 0.0, y: -1.0 },
+                                    6 => ScrollDelta::Lines { x: -1.0, y: 0.0 },
+                                    7 => ScrollDelta::Lines { x: 1.0, y: 0.0 },
+                                    _ => unreachable!(),
+                                },
                                 modifiers: key_mods(event.state()),
                             }),
                         );
@@ -628,7 +646,7 @@ impl Window {
                 let event = unsafe { xcb::cast_event::<xcb::ButtonPressEvent>(&event) };
                 let detail = event.detail();
 
-                if detail != 4 && detail != 5 {
+                if !(4..=7).contains(&detail) {
                     let button_id = mouse_id(detail);
                     handler.on_event(
                         &mut crate::Window::new(self),
@@ -681,8 +699,12 @@ fn mouse_id(id: u8) -> MouseButton {
         1 => MouseButton::Left,
         2 => MouseButton::Middle,
         3 => MouseButton::Right,
-        6 => MouseButton::Back,
-        7 => MouseButton::Forward,
+        8 => MouseButton::Back,
+        9 => MouseButton::Forward,
         id => MouseButton::Other(id),
     }
+}
+
+pub fn copy_to_clipboard(data: &str) {
+    todo!()
 }

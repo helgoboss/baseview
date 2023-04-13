@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::MouseEvent::{ButtonPressed, ButtonReleased};
 use crate::{
-    Event, EventStatus, MouseButton, MouseEvent, Point, Size, WindowEvent, WindowInfo,
+    Event, EventStatus, MouseButton, MouseEvent, Point, ScrollDelta, Size, WindowEvent, WindowInfo,
     WindowOpenOptions,
 };
 
@@ -147,6 +147,8 @@ unsafe fn create_view_class() -> &'static Class {
     class.add_method(sel!(rightMouseDragged:), mouse_moved as extern "C" fn(&Object, Sel, id));
     class.add_method(sel!(otherMouseDragged:), mouse_moved as extern "C" fn(&Object, Sel, id));
 
+    class.add_method(sel!(scrollWheel:), scroll_wheel as extern "C" fn(&Object, Sel, id));
+
     class.add_method(
         sel!(viewDidChangeBackingProperties:),
         view_did_change_backing_properties as extern "C" fn(&Object, Sel, id),
@@ -232,18 +234,23 @@ extern "C" fn view_did_change_backing_properties(this: &Object, _: Sel, _: id) {
         let ns_window: *mut Object = msg_send![this, window];
 
         let scale_factor: f64 =
-            if ns_window.is_null() { 1.0 } else { NSWindow::backingScaleFactor(ns_window) as f64 };
+            if ns_window.is_null() { 1.0 } else { NSWindow::backingScaleFactor(ns_window) };
 
         let state: &mut WindowState = WindowState::from_field(this);
 
         let bounds: NSRect = msg_send![this, bounds];
 
-        let window_info = WindowInfo::from_logical_size(
+        let new_window_info = WindowInfo::from_logical_size(
             Size::new(bounds.size.width, bounds.size.height),
             scale_factor,
         );
 
-        state.trigger_event(Event::Window(WindowEvent::Resized(window_info)));
+        // Only send the event when the window's size has actually changed to be in line with the
+        // other platform implementations
+        if new_window_info.physical_size() != state.window_info.physical_size() {
+            state.window_info = new_window_info;
+            state.trigger_event(Event::Window(WindowEvent::Resized(new_window_info)));
+        }
     }
 }
 
@@ -340,6 +347,28 @@ extern "C" fn mouse_moved(this: &Object, _sel: Sel, event: id) {
 
     state.trigger_event(Event::Mouse(MouseEvent::CursorMoved {
         position,
+        modifiers: make_modifiers(modifiers),
+    }));
+}
+
+extern "C" fn scroll_wheel(this: &Object, _: Sel, event: id) {
+    let state: &mut WindowState = unsafe { WindowState::from_field(this) };
+
+    let delta = unsafe {
+        let x = NSEvent::scrollingDeltaX(event) as f32;
+        let y = NSEvent::scrollingDeltaY(event) as f32;
+
+        if NSEvent::hasPreciseScrollingDeltas(event) != NO {
+            ScrollDelta::Pixels { x, y }
+        } else {
+            ScrollDelta::Lines { x, y }
+        }
+    };
+
+    let modifiers = unsafe { NSEvent::modifierFlags(event) };
+
+    state.trigger_event(Event::Mouse(MouseEvent::WheelScrolled {
+        delta,
         modifiers: make_modifiers(modifiers),
     }));
 }
